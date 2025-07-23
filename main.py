@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from pdf_processor import extract_outline
+from pdf_processor import process_pdf
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,7 +29,7 @@ def main():
         output_filename = os.path.splitext(pdf_file)[0] + ".json"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
 
-        result = extract_outline(pdf_path)
+        result = process_pdf(pdf_path)
 
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)

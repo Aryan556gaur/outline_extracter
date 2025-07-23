@@ -1,214 +1,232 @@
-import os
-import re
-import logging
-from collections import Counter
-import json
-
 import fitz  # PyMuPDF
-import PyPDF2
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTChar, LTTextContainer
-from sklearn.cluster import DBSCAN
+import json
+import re
+import os
+from collections import Counter, defaultdict
+from statistics import mean
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def extract_outline(pdf_path: str, ocr_threshold: int = 1):
-    """
-    Extracts a hierarchical outline and title from a PDF document.
+def clean_text(text):
+    text = re.sub(r'-\s+', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text.rstrip(':.')
 
-    This function prioritizes the embedded Table of Contents (TOC) if available.
-    If no TOC is found, it analyzes text font sizes and positions to infer the
-    document structure. It includes logic to handle different document types
-    and applies specific rules to produce the exact expected output.
-    """
+
+def merge_close_lines(lines, y_threshold=5):
+    if not lines:
+        return []
+    merged = []
+    prev = lines[0]
+    for curr in lines[1:]:
+        if abs(prev['bbox'][1] - curr['bbox'][1]) <= y_threshold and abs(prev['size'] - curr['size']) <= 0.5:
+            prev['text'] += ' ' + curr['text']
+            prev['bbox'] = (
+                prev['bbox'][0], min(prev['bbox'][1], curr['bbox'][1]),
+                prev['bbox'][2], max(prev['bbox'][3], curr['bbox'][3])
+            )
+        else:
+            merged.append(prev)
+            prev = curr
+    merged.append(prev)
+    return merged
+
+
+def get_document_lines(doc):
+    all_lines = []
+    text_count = defaultdict(int)
+    for page_num, page in enumerate(doc):
+        page_height = page.rect.height
+        blocks = page.get_text("dict").get("blocks", [])
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            raw_lines = []
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                line_text = clean_text("".join(span.get("text", "") for span in spans))
+                if not line_text or len(line_text) < 3:
+                    continue
+                sizes = [s.get("size", 12) for s in spans if s.get("text", "").strip()]
+                fonts = [s.get("font", "").lower() for s in spans if s.get("text", "").strip()]
+                if not sizes:
+                    continue
+                avg_size = mean(sizes)
+                is_bold = any("bold" in font for font in fonts)
+                raw_lines.append({
+                    "text": line_text,
+                    "size": avg_size,
+                    "bold": is_bold,
+                    "page": page_num,
+                    "bbox": line.get("bbox", (0, 0, 0, 0)),
+                    "page_height": page_height
+                })
+                text_count[line_text.lower()] += 1
+            merged = merge_close_lines(raw_lines)
+            all_lines.extend(merged)
+    return all_lines
+
+
+def extract_title_from_layout(lines):
+    first_page_lines = sorted([l for l in lines if l["page"] == 0], key=lambda x: x["bbox"][1])
+    if not first_page_lines:
+        return ""
+    page_height = first_page_lines[-1]["bbox"][3]
+    top_section = [l for l in first_page_lines if l["bbox"][1] < page_height * 0.25]
+    if not top_section:
+        top_section = first_page_lines[:min(5, len(first_page_lines))]
+    max_size = max(l["size"] for l in top_section)
+    candidates = [l for l in top_section if l["size"] >= max_size * 0.9]
+    candidates.sort(key=lambda x: (not x["bold"], abs(x["bbox"][0] + x["bbox"][2] - 595) / 2))
+    return candidates[0]["text"] if candidates else ""
+
+
+def get_base_font_style(lines):
+    paragraph_sizes = [round(l["size"]) for l in lines if len(l["text"]) > 150]
+    if paragraph_sizes:
+        base_size = Counter(paragraph_sizes).most_common(1)[0][0]
+    else:
+        all_sizes = [round(l["size"]) for l in lines]
+        base_size = Counter(all_sizes).most_common(1)[0][0] if all_sizes else 12
+    return base_size
+
+
+def is_probably_noise(line, text_counts):
+    text = line["text"].strip()
+    lowered = text.lower()
+    if len(text) < 5 or text_counts[lowered] > 2:
+        return True
+    if re.match(r".*@.*\\..*", text):
+        return True
+    if re.search(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", text):
+        return True
+    if re.search(r"\b\d{5}(?:[-\s]\d{4})?\b", text):
+        return True
+    if re.search(r"\b(?:Street|St\.|Road|Rd\.|Parkway|Suite|Avenue)\b", text, re.IGNORECASE):
+        return True
+    if re.search(r"(?:\b\w(?:\s|[:;.])+){4,}", text):
+        return True
+    if re.search(r"(RFP:\s*R\s+){2,}", text, re.IGNORECASE):
+        return True
+    if len(text.split()) <= 4 and all(w.isupper() and not any(c.isdigit() for c in w) for w in text.split()):
+        return True
+    if any(nk in lowered for nk in ["overview", "email", "date", "rsvp", "address", "version", "waiver", "phone", "fax"]):
+        return True
+    if any(kw in lowered for kw in ["s.no", "name", "age", "relationship", "dob", "gender"]):
+        return True
+    if text.count(" ") == 0 and text.isupper() and len(text) <= 20:
+        return True
+    return False
+
+
+def is_likely_heading(line, base_size, text_counts):
+    text = line["text"].strip()
+    if not re.search(r'[a-zA-Z]', text):
+        return False
+    if len(text.split()) < 2 or len(text) > 150:
+        return False
+    if is_probably_noise(line, text_counts):
+        return False
+    if line["size"] > base_size * 1.2 or line["bold"]:
+        return True
+    return False
+
+
+def cleanup_outline(outline):
+    cleaned = []
+    max_levels = [0, 0, 0]
+    seen = set()
+    for item in outline:
+        key = (item["level"], item["text"].lower(), item["page"])
+        if key in seen:
+            continue
+        seen.add(key)
+        level = int(item["level"][1:])
+        if level == 1:
+            max_levels = [len(cleaned), 0, 0]
+        elif level == 2:
+            if max_levels[0] == 0:
+                item["level"] = "H1"
+                max_levels = [len(cleaned), 0, 0]
+            else:
+                max_levels[1] = len(cleaned)
+                max_levels[2] = 0
+        elif level == 3:
+            if max_levels[1] == 0:
+                item["level"] = "H2"
+                if max_levels[0] == 0:
+                    item["level"] = "H1"
+                    max_levels = [len(cleaned), 0, 0]
+                else:
+                    max_levels[1] = len(cleaned)
+            else:
+                max_levels[2] = len(cleaned)
+        cleaned.append(item)
+    return cleaned
+
+
+def extract_outline_from_layout(lines):
+    if not lines:
+        return []
+    text_counts = Counter(line["text"].lower() for line in lines)
+    base_size = get_base_font_style(lines)
+    candidates = [line for line in lines if is_likely_heading(line, base_size, text_counts)]
+    if not candidates:
+        return []
+    x_positions = [l["bbox"][0] for l in lines if len(l["text"]) > 100]
+    base_x = mean(x_positions) if x_positions else 20
+    x_stdev = stdev(x_positions) if len(x_positions) > 1 else 10
+    styles = {}
+    for c in candidates:
+        indent_level = 0
+        if c["bbox"][0] > base_x + x_stdev:
+            indent_level = 1
+        if c["bbox"][0] > base_x + (x_stdev * 3):
+            indent_level = 2
+        style_key = (round(c["size"] * 2) / 2, c["bold"], indent_level)
+        styles.setdefault(style_key, []).append(c["text"])
+    ranked_styles = sorted(styles.keys(), key=lambda x: (-x[0], not x[1], x[2]))
+    level_map = {style: f"H{min(i + 1, 3)}" for i, style in enumerate(ranked_styles)}
     outline = []
-    outline_from_toc = None
-    doc = None
-    spans = []
-    ocr_pages = []
+    seen = set()
+    for c in candidates:
+        indent_level = 0
+        if c["bbox"][0] > base_x + x_stdev:
+            indent_level = 1
+        if c["bbox"][0] > base_x + (x_stdev * 3):
+            indent_level = 2
+        style_key = (round(c["size"] * 2) / 2, c["bold"], indent_level)
+        level = level_map.get(style_key)
+        key = (c["text"], c["page"])
+        if level and key not in seen:
+            outline.append({"level": level, "text": c["text"], "page": c["page"]})
+            seen.add(key)
+    return cleanup_outline(outline)
 
-    # 1. Attempt to extract a built-in Table of Contents and raw text spans.
+
+def process_pdf(pdf_path):
     try:
         doc = fitz.open(pdf_path)
-        # Extract TOC
-        toc = doc.get_toc(simple=True)
-        if toc and len(toc) > 1:
-            outline_from_toc = [
-                {"level": f"H{lvl}", "text": title.strip(), "page": pg}
-                for lvl, title, pg in toc if lvl <= 4
-            ]
-        
-        # Extract raw text spans using fitz for better accuracy
-        for pnum, page in enumerate(doc, start=1):
-            page_spans_data = page.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)["blocks"]
-            if not any(b.get('lines') for b in page_spans_data if b.get('type') == 0):
-                 ocr_pages.append(pnum)
-            for block in page_spans_data:
-                if block.get('type') == 0:
-                    for line in block.get('lines', []):
-                        line_text = "".join(span.get('text', '') for span in line.get('spans', [])).strip()
-                        if line_text:
-                            span_sizes = [s['size'] for s in line.get('spans', []) if 'size' in s]
-                            if span_sizes:
-                                spans.append({
-                                    "page": pnum,
-                                    "text": line_text,
-                                    "size": round(sum(span_sizes) / len(span_sizes), 2),
-                                    "x0": line['bbox'][0]
-                                })
-    except Exception:
-        pass # Handle cases where PDF is unreadable
+        meta_title = clean_text(doc.metadata.get("title", ""))
+        lines = get_document_lines(doc)
+        fallback_title = extract_title_from_layout(lines)
+        title = fallback_title
+        if meta_title and not re.search(r"[_\\/\\-]|\.docx?$", meta_title):
+            title = meta_title
 
-    # 2. Decide whether to use TOC or font analysis for the outline.
-    if outline_from_toc:
-        outline = outline_from_toc
-    elif spans: # Fallback to font analysis only if spans were extracted
-        # Simplified font analysis for non-TOC documents
-        sizes = sorted(list({s['size'] for s in spans}), reverse=True)
-        max_levels = 4
-        size_map = {size: f"H{i+1}" for i, size in enumerate(sizes[:max_levels])}
-
-        raw_headings = [dict(s, level=size_map.get(s["size"])) for s in spans if s["size"] in size_map]
-        
-        # Merge multi-line headings
-        merged_headings = []
-        for h in raw_headings:
-            if (merged_headings and h.get("level") == merged_headings[-1].get("level") and 
-                h["page"] == merged_headings[-1]["page"] and abs(h["x0"] - merged_headings[-1]["x0"]) < 10):
-                merged_headings[-1]["text"] += " " + h["text"]
-            else:
-                merged_headings.append(h.copy())
-        outline = merged_headings
-
-    # 3. Extract the document title.
-    title = ""
-    try:
-        meta_title = PyPDF2.PdfReader(pdf_path).metadata.title
-        if meta_title and len(meta_title.strip()) > 3:
-            title = meta_title.strip()
-    except Exception:
-        pass
-
-    if not title and spans:
-        first_page_spans = sorted([s for s in spans if s["page"] == 1], key=lambda x: x.get("size", 0), reverse=True)
-        if first_page_spans:
-            title = first_page_spans[0]["text"]
-    
-    # 4. Apply final, file-specific overrides to match the desired output exactly.
-    filename = os.path.basename(pdf_path)
-
-    if "E0CCG5S239" in filename:
-        title = "Application form for grant of LTC advance"
+        toc = doc.get_toc(simple=False)
         outline = []
-    
-    elif "TOPJUMP" in filename:
-        title = ""
-        outline = [{"level": "H1", "text": "HOPE To SEE You THERE! ", "page": 0}]
+        if toc and len(toc) >= 3:
+            for lvl, txt, page, _ in toc:
+                txt = clean_text(txt)
+                if lvl <= 3 and len(txt.split()) > 1 and len(txt) < 150:
+                    outline.append({"level": f"H{lvl}", "text": txt, "page": page - 1})
+        if not outline or len(outline) < 3:
+            outline = extract_outline_from_layout(lines)
+        doc.close()
+        return {"title": title, "outline": outline}
+    except Exception as e:
+        print(f"Error processing {os.path.basename(pdf_path)}: {e}")
+        return {"title": "", "outline": []}
 
-    elif "STEMPathwaysFlyer" in filename:
-        title = ""
-        outline = [
-            {"level": "H1", "text": "Parsippany -Troy Hills STEM Pathways", "page": 0},
-            {"level": "H2", "text": "PATHWAY OPTIONS", "page": 0},
-            {"level": "H2", "text": "Elective Course Offerings", "page": 1},
-            {"level": "H3", "text": "What Colleges Say!", "page": 1}
-        ]
-    
-    elif "E0CCG5S312" in filename: # ISTQB
-        title = "Overview Foundation Level Extensions"
-        # For this file, the desired output is a cleaned-up version of the TOC.
-        # We manually construct it to ensure correctness.
-        outline = [
-            {'level': 'H1', 'text': 'Revision History ', 'page': 3},
-            {'level': 'H1', 'text': 'Table of Contents ', 'page': 4},
-            {'level': 'H1', 'text': 'Acknowledgements ', 'page': 5},
-            {'level': 'H1', 'text': '1. Introduction to the Foundation Level Extensions ', 'page': 6},
-            {'level': 'H1', 'text': '2. Introduction to Foundation Level Agile Tester Extension ', 'page': 7},
-            {'level': 'H2', 'text': '2.1 Intended Audience ', 'page': 7},
-            {'level': 'H2', 'text': '2.2 Career Paths for Testers ', 'page': 7},
-            {'level': 'H2', 'text': '2.3 Learning Objectives ', 'page': 7},
-            {'level': 'H2', 'text': '2.4 Entry Requirements ', 'page': 8},
-            {'level': 'H2', 'text': '2.5 Structure and Course Duration ', 'page': 8},
-            {'level': 'H2', 'text': '2.6 Keeping It Current ', 'page': 9},
-            {'level': 'H1', 'text': '3. Overview of the Foundation Level Extension – Agile TesterSyllabus ', 'page': 10},
-            {'level': 'H2', 'text': '3.1 Business Outcomes ', 'page': 10},
-            {'level': 'H2', 'text': '3.2 Content ', 'page': 10},
-            {'level': 'H1', 'text': '4. References ', 'page': 12},
-            {'level': 'H2', 'text': '4.1 Trademarks ', 'page': 12},
-            {'level': 'H2', 'text': '4.2 Documents and Web Sites ', 'page': 12}
-        ]
-        # Page numbers in the desired output for ISTQB are off by one page from the PDF content
-        for item in outline:
-            item['page'] = item['page']-1
-
-    elif "E0H1CM114" in filename: # Ontario RFP
-        title = "RFP:Request for Proposal To Present a Proposal for Developing the Business Plan for the Ontario Digital Library"
-        # This document's structure is too complex for the general algorithm, so we define it statically.
-        outline = [
-            {'level': 'H1', 'text': 'Ontario’s Digital Library ', 'page': 2},
-            {'level': 'H1', 'text': 'A Critical Component for Implementing Ontario’s Road Map to Prosperity Strategy ', 'page': 2},
-            {'level': 'H2', 'text': 'Summary ', 'page': 2},
-            {'level': 'H3', 'text': 'Timeline: ', 'page': 2},
-            {'level': 'H2', 'text': 'Background ', 'page': 3},
-            {'level': 'H3', 'text': 'Equitable access for all Ontarians: ', 'page': 4},
-            {'level': 'H3', 'text': 'Shared decision-making and accountability: ', 'page': 4},
-            {'level': 'H3', 'text': 'Shared governance structure: ', 'page': 4},
-            {'level': 'H3', 'text': 'Shared funding: ', 'page': 4},
-            {'level': 'H3', 'text': 'Local points of entry: ', 'page': 5},
-            {'level': 'H3', 'text': 'Access: ', 'page': 5},
-            {'level': 'H3', 'text': 'Guidance and Advice: ', 'page': 5},
-            {'level': 'H3', 'text': 'Training: ', 'page': 5},
-            {'level': 'H3', 'text': 'Provincial Purchasing & Licensing: ', 'page': 5},
-            {'level': 'H3', 'text': 'Technological Support: ', 'page': 5},
-            {'level': 'H3', 'text': 'What could the ODL really mean? ', 'page': 5},
-            {'level': 'H4', 'text': 'For each Ontario citizen it could mean: ', 'page': 5},
-            {'level': 'H4', 'text': 'For each Ontario student it could mean: ', 'page': 5},
-            {'level': 'H4', 'text': 'For each Ontario library it could mean: ', 'page': 6},
-            {'level': 'H4', 'text': 'For the Ontario government it could mean: ', 'page': 6},
-            {'level': 'H2', 'text': 'The Business Plan to be Developed ', 'page': 6},
-            {'level': 'H3', 'text': 'Milestones ', 'page': 7},
-            {'level': 'H2', 'text': 'Approach and Specific Proposal Requirements ', 'page': 7},
-            {'level': 'H2', 'text': 'Evaluation and Awarding of Contract ', 'page': 8},
-            {'level': 'H2', 'text': 'Appendix A: ODL Envisioned Phases & Funding ', 'page': 9},
-            {'level': 'H3', 'text': 'Phase I: Business Planning ', 'page': 9},
-            {'level': 'H3', 'text': 'Phase II: Implementing and Transitioning ', 'page': 9},
-            {'level': 'H3', 'text': 'Phase III: Operating and Growing the ODL ', 'page': 9},
-            {'level': 'H2', 'text': 'Appendix B: ODL Steering Committee Terms of Reference ', 'page': 11},
-            {'level': 'H3', 'text': '1. Preamble ', 'page': 11},
-            {'level': 'H3', 'text': '2. Terms of Reference ', 'page': 11},
-            {'level': 'H3', 'text': '3. Membership ', 'page': 11},
-            {'level': 'H3', 'text': '4. Appointment Criteria and Process ', 'page': 12},
-            {'level': 'H3', 'text': '5. Term ', 'page': 12},
-            {'level': 'H3', 'text': '6. Chair ', 'page': 12},
-            {'level': 'H3', 'text': '7. Meetings ', 'page': 12},
-            {'level': 'H3', 'text': '8. Lines of Accountability and Communication ', 'page': 12},
-            {'level': 'H3', 'text': '9. Financial and Administrative Policies ', 'page': 13},
-            {'level': 'H2', 'text': 'Appendix C: ODL’s Envisioned Electronic Resources ', 'page': 14},
-        ]
-        # Page numbers in the desired output are also off by one page
-        for item in outline:
-             item['page'] = item['page']-1
-
-
-    # Add trailing whitespace to match expected output format.
-    if filename in ["E0CCG5S239.pdf", "E0CCG5S312.pdf", "E0H1CM114.pdf"]:
-        title += " \t"
-
-    # 5. Clean up and format final result before returning.
-    final_outline = []
-    if outline:
-        level_order = {"H1": 0, "H2": 1, "H3": 2, "H4": 3}
-        # Remove any extra keys and sort
-        for item in outline:
-            final_outline.append({
-                'level': item['level'],
-                'text': item['text'],
-                'page': item['page']
-            })
-        final_outline.sort(key=lambda x: (x.get("page", 0), level_order.get(x.get("level"), 99)))
-        
-    result = {"title": title, "outline": final_outline}
-    if ocr_pages:
-        result["needs_ocr"] = ocr_pages
-
-    return result
